@@ -1,0 +1,24 @@
+{
+  "stable_asset": "USDT",
+  "use_testnet": true,
+  "dry_run": true,
+  "check_interval_sec": 30,
+  "pairs": [
+    {
+      "name": "HBAR_DOGE",
+      "coin_a": "HBAR",
+      "coin_b": "DOGE",
+      "upper_ratio": 1.05,
+      "lower_ratio": 0.95,
+      "allocation_pct": 0.3
+    },
+    {
+      "name": "XRP_XLM",
+      "coin_a": "XRP",
+      "coin_b": "XLM",
+      "upper_ratio": 1.08,
+      "lower_ratio": 0.92,
+      "allocation_pct": 0.2
+    }
+  ]
+}

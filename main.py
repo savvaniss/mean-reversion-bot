@@ -8,74 +8,37 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
-# =========================
-# LOAD .env CONFIG
-# =========================
+CONFIG_FILE = "config.json"
+STATE_FILE = "state.json"
+STATUS_FILE = "status.json"
 
-# .env example:
-# BINANCE_API_KEY=....
-# BINANCE_API_SECRET=....
-# USE_TESTNET=true
-# STABLE_ASSET=USDT
 load_dotenv()
 
 API_KEY = os.getenv("BINANCE_API_KEY")
 API_SECRET = os.getenv("BINANCE_API_SECRET")
 
-USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() in ("1", "true", "yes")
-STABLE = os.getenv("STABLE_ASSET", "USDT")
 
-CHECK_INTERVAL_SEC = 30
-DRY_RUN = True  # keep True while testing
-
-STATE_FILE = "state.json"
+def now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-# =========================
-# PAIRS CONFIG
-# =========================
-# Each pair:
-#  - coin_a, coin_b    : two assets that both trade vs STABLE
-#  - upper_ratio/lower_ratio: thresholds for HBAR/DOGE-style rotation
-#  - allocation_pct    : max fraction of TOTAL portfolio this pair can use
-
-PAIRS = [
-    {
-        "name": "HBAR_DOGE",
-        "coin_a": "HBAR",
-        "coin_b": "DOGE",
-        "upper_ratio": 1.05,
-        "lower_ratio": 0.95,
-        "allocation_pct": 0.30,  # 30% of portfolio
-    },
-    {
-        "name": "XRP_XLM",
-        "coin_a": "XRP",
-        "coin_b": "XLM",
-        "upper_ratio": 1.08,
-        "lower_ratio": 0.92,
-        "allocation_pct": 0.20,  # 20% of portfolio
-    },
-    # add more pairs if you like
-]
+def load_config() -> Dict[str, Any]:
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
 
 
-# =========================
-# STATE HANDLING
-# =========================
-
-def default_state() -> Dict[str, Any]:
+def default_state(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return {
         pair["name"]: {
             "current_asset": pair["coin_a"]
         }
-        for pair in PAIRS
+        for pair in cfg["pairs"]
     }
 
 
-def load_state() -> Dict[str, Any]:
+def load_state(cfg: Dict[str, Any]) -> Dict[str, Any]:
     if not os.path.exists(STATE_FILE):
-        state = default_state()
+        state = default_state(cfg)
         save_state(state)
         return state
     with open(STATE_FILE, "r") as f:
@@ -87,20 +50,16 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, indent=2)
 
 
-def now_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+def save_status(status: Dict[str, Any]) -> None:
+    with open(STATUS_FILE, "w") as f:
+        json.dump(status, f, indent=2)
 
 
-def to_symbol(coin: str) -> str:
-    """Convert coin + STABLE to Binance symbol, e.g. HBAR -> HBARUSDT."""
-    return f"{coin}{STABLE}"
+def to_symbol(coin: str, stable: str) -> str:
+    return f"{coin}{stable}"
 
 
 def load_tickers(client: Client, symbols: Set[str]) -> Dict[str, float]:
-    """
-    Fetch latest prices for the given Binance symbols (e.g. 'HBARUSDT').
-    Returns dict {symbol: price_float}.
-    """
     prices: Dict[str, float] = {}
     for sym in symbols:
         try:
@@ -114,9 +73,6 @@ def load_tickers(client: Client, symbols: Set[str]) -> Dict[str, float]:
 
 
 def load_balances(client: Client) -> Dict[str, float]:
-    """
-    Return dict {asset: free_balance_float}.
-    """
     acct = client.get_account()
     balances: Dict[str, float] = {}
     for b in acct["balances"]:
@@ -127,10 +83,6 @@ def load_balances(client: Client) -> Dict[str, float]:
     return balances
 
 
-# =========================
-# MAIN BOT LOGIC
-# =========================
-
 def main():
     if not API_KEY or not API_SECRET:
         raise SystemExit(
@@ -138,24 +90,22 @@ def main():
             "in your environment or .env file."
         )
 
-    # python-binance client (handles testnet correctly)
+    cfg = load_config()
+    STABLE = cfg.get("stable_asset", "USDT")
+    USE_TESTNET = bool(cfg.get("use_testnet", True))
+    DRY_RUN = bool(cfg.get("dry_run", True))
+    CHECK_INTERVAL_SEC = int(cfg.get("check_interval_sec", 30))
+
     client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
 
-    # Collect all Binance symbols we’ll need
-    needed_symbols: Set[str] = set()
-    needed_symbols.add(to_symbol("BTC"))
-    for pair in PAIRS:
-        needed_symbols.add(to_symbol(pair["coin_a"]))
-        needed_symbols.add(to_symbol(pair["coin_b"]))
-
-    state = load_state()
+    state = load_state(cfg)
 
     print("=== Multi-Pair Ratio Bot (python-binance) ===")
     print(f"Stable asset  : {STABLE}")
     print(f"Use testnet   : {USE_TESTNET}")
     print(f"DRY_RUN       : {DRY_RUN}")
     print("Pairs:")
-    for p in PAIRS:
+    for p in cfg["pairs"]:
         print(
             f" - {p['name']}: {p['coin_a']}/{p['coin_b']} "
             f"(upper={p['upper_ratio']}, lower={p['lower_ratio']}, "
@@ -166,21 +116,32 @@ def main():
 
     while True:
         try:
+            # reload config each loop (so UI changes take effect)
+            cfg = load_config()
+            STABLE = cfg.get("stable_asset", "USDT")
+            USE_TESTNET = bool(cfg.get("use_testnet", True))
+            DRY_RUN = bool(cfg.get("dry_run", True))
+            CHECK_INTERVAL_SEC = int(cfg.get("check_interval_sec", 30))
+            pairs = cfg["pairs"]
+
             print("=" * 100)
             print(now_str())
 
-            # ----- Tickers -----
+            needed_symbols: Set[str] = set()
+            needed_symbols.add(to_symbol("BTC", STABLE))
+            for pair in pairs:
+                needed_symbols.add(to_symbol(pair["coin_a"], STABLE))
+                needed_symbols.add(to_symbol(pair["coin_b"], STABLE))
+
             tickers = load_tickers(client, needed_symbols)
 
-            btc_symbol = to_symbol("BTC")
+            btc_symbol = to_symbol("BTC", STABLE)
             btc_price = tickers.get(btc_symbol)
             if btc_price:
                 print(f"{btc_symbol}: {btc_price:.6f}")
 
-            # ----- Balances -----
             free_bal = load_balances(client)
 
-            # Total portfolio in STABLE
             total_value_stable = 0.0
             for asset, amount in free_bal.items():
                 if amount <= 0:
@@ -195,8 +156,16 @@ def main():
 
             print(f"Estimated total portfolio value: {total_value_stable:.2f} {STABLE}")
 
-            # ----- Each pair -----
-            for pair in PAIRS:
+            status_out: Dict[str, Any] = {
+                "timestamp": now_str(),
+                "stable_asset": STABLE,
+                "use_testnet": USE_TESTNET,
+                "dry_run": DRY_RUN,
+                "total_value_stable": total_value_stable,
+                "pairs": [],
+            }
+
+            for pair in pairs:
                 name = pair["name"]
                 coin_a = pair["coin_a"]
                 coin_b = pair["coin_b"]
@@ -204,8 +173,8 @@ def main():
                 lower = pair["lower_ratio"]
                 alloc_pct = pair["allocation_pct"]
 
-                sym_a = to_symbol(coin_a)
-                sym_b = to_symbol(coin_b)
+                sym_a = to_symbol(coin_a, STABLE)
+                sym_b = to_symbol(coin_b, STABLE)
 
                 price_a = tickers.get(sym_a)
                 price_b = tickers.get(sym_b)
@@ -254,9 +223,27 @@ def main():
 
                 print(f"[{name}] current_asset: {current_asset}, next_plan: {next_plan}")
 
-                # ===== EXECUTION =====
+                # collect for status.json (for UI)
+                status_out["pairs"].append({
+                    "name": name,
+                    "coin_a": coin_a,
+                    "coin_b": coin_b,
+                    "price_a": price_a,
+                    "price_b": price_b,
+                    "ratio": ratio,
+                    "upper_ratio": upper,
+                    "lower_ratio": lower,
+                    "allocation_pct": alloc_pct,
+                    "bal_a": bal_a,
+                    "bal_b": bal_b,
+                    "bal_stable": bal_stable,
+                    "value_pair": value_pair,
+                    "max_capital": max_capital,
+                    "current_asset": current_asset,
+                    "next_plan": next_plan,
+                })
 
-                # From coin_a -> coin_b
+                # === EXECUTION (same as before) ===
                 if current_asset == coin_a and ratio > upper:
                     if value_pair <= 0:
                         print(f"[{name}] No {coin_a} value to trade, skipping.")
@@ -279,7 +266,6 @@ def main():
                         print(f"[{name}] [DRY RUN] SELL {sym_a} {amount_a_to_sell:.6f}")
                         print(f"[{name}] [DRY RUN] Then BUY {sym_b} with available {STABLE}")
                     else:
-                        # Market sell coin_a for STABLE
                         try:
                             sell_order = client.order_market_sell(
                                 symbol=sym_a,
@@ -290,7 +276,6 @@ def main():
                             print(f"[{name}] Sell order error: {e}")
                             continue
 
-                        # Refresh balances after sell
                         free_bal = load_balances(client)
                         bal_stable = free_bal.get(STABLE, 0.0)
 
@@ -312,7 +297,6 @@ def main():
                         state[name] = pair_state
                         save_state(state)
 
-                # From coin_b -> coin_a
                 elif current_asset == coin_b and ratio < lower:
                     if value_pair <= 0:
                         print(f"[{name}] No {coin_b} value to trade, skipping.")
@@ -335,7 +319,6 @@ def main():
                         print(f"[{name}] [DRY RUN] SELL {sym_b} {amount_b_to_sell:.6f}")
                         print(f"[{name}] [DRY RUN] Then BUY {sym_a} with available {STABLE}")
                     else:
-                        # Market sell coin_b for STABLE
                         try:
                             sell_order = client.order_market_sell(
                                 symbol=sym_b,
@@ -366,11 +349,13 @@ def main():
                         pair_state["current_asset"] = coin_a
                         state[name] = pair_state
                         save_state(state)
-
                 else:
                     print(f"[{name}] No trade condition met, holding.")
 
                 print()
+
+            # write status.json for the UI
+            save_status(status_out)
 
         except Exception as e:
             print("GLOBAL ERROR:", repr(e))
