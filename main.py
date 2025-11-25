@@ -2,17 +2,17 @@ import os
 import time
 import json
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Set
 
-import ccxt
+from binance.client import Client
+from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 
 # =========================
 # LOAD .env CONFIG
 # =========================
 
-# Reads .env in current folder (if present)
-# Example .env:
+# .env example:
 # BINANCE_API_KEY=....
 # BINANCE_API_SECRET=....
 # USE_TESTNET=true
@@ -91,6 +91,42 @@ def now_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
+def to_symbol(coin: str) -> str:
+    """Convert coin + STABLE to Binance symbol, e.g. HBAR -> HBARUSDT."""
+    return f"{coin}{STABLE}"
+
+
+def load_tickers(client: Client, symbols: Set[str]) -> Dict[str, float]:
+    """
+    Fetch latest prices for the given Binance symbols (e.g. 'HBARUSDT').
+    Returns dict {symbol: price_float}.
+    """
+    prices: Dict[str, float] = {}
+    for sym in symbols:
+        try:
+            t = client.get_symbol_ticker(symbol=sym)
+            prices[sym] = float(t["price"])
+        except BinanceAPIException as e:
+            print(f"Ticker error for {sym}: {e}")
+        except Exception as e:
+            print(f"Unknown ticker error for {sym}: {e}")
+    return prices
+
+
+def load_balances(client: Client) -> Dict[str, float]:
+    """
+    Return dict {asset: free_balance_float}.
+    """
+    acct = client.get_account()
+    balances: Dict[str, float] = {}
+    for b in acct["balances"]:
+        free_amt = float(b["free"])
+        locked_amt = float(b["locked"])
+        if free_amt > 0 or locked_amt > 0:
+            balances[b["asset"]] = free_amt
+    return balances
+
+
 # =========================
 # MAIN BOT LOGIC
 # =========================
@@ -102,35 +138,19 @@ def main():
             "in your environment or .env file."
         )
 
-    exchange = ccxt.binance({
-        "apiKey": API_KEY,
-        "secret": API_SECRET,
-        "enableRateLimit": True,
-        "options": {
-            "defaultType": "spot",
-        },
-    })
+    # python-binance client (handles testnet correctly)
+    client = Client(API_KEY, API_SECRET, testnet=USE_TESTNET)
 
-    if USE_TESTNET:
-        exchange.set_sandbox_mode(True)
-
-        # 🔥 Required for Binance Spot Testnet to avoid signature errors
-        exchange.urls["api"] = {
-            "public": "https://testnet.binance.vision/api",
-            "private": "https://testnet.binance.vision/api",
-        }
-
-
-    # Collect all tickers we’ll need (for efficiency)
-    needed_symbols = set()
-    needed_symbols.add(f"BTC/{STABLE}")
+    # Collect all Binance symbols we’ll need
+    needed_symbols: Set[str] = set()
+    needed_symbols.add(to_symbol("BTC"))
     for pair in PAIRS:
-        needed_symbols.add(f"{pair['coin_a']}/{STABLE}")
-        needed_symbols.add(f"{pair['coin_b']}/{STABLE}")
+        needed_symbols.add(to_symbol(pair["coin_a"]))
+        needed_symbols.add(to_symbol(pair["coin_b"]))
 
     state = load_state()
 
-    print("=== Multi-Pair Ratio Bot ===")
+    print("=== Multi-Pair Ratio Bot (python-binance) ===")
     print(f"Stable asset  : {STABLE}")
     print(f"Use testnet   : {USE_TESTNET}")
     print(f"DRY_RUN       : {DRY_RUN}")
@@ -150,16 +170,15 @@ def main():
             print(now_str())
 
             # ----- Tickers -----
-            tickers = exchange.fetch_tickers(list(needed_symbols))
+            tickers = load_tickers(client, needed_symbols)
 
-            btc_symbol = f"BTC/{STABLE}"
-            btc_price = tickers.get(btc_symbol, {}).get("last")
+            btc_symbol = to_symbol("BTC")
+            btc_price = tickers.get(btc_symbol)
             if btc_price:
                 print(f"{btc_symbol}: {btc_price:.6f}")
 
             # ----- Balances -----
-            balances = exchange.fetch_balance()
-            free_bal = balances["free"]
+            free_bal = load_balances(client)
 
             # Total portfolio in STABLE
             total_value_stable = 0.0
@@ -169,9 +188,10 @@ def main():
                 if asset == STABLE:
                     total_value_stable += amount
                 else:
-                    sym = f"{asset}/{STABLE}"
-                    if sym in tickers and tickers[sym].get("last"):
-                        total_value_stable += amount * tickers[sym]["last"]
+                    sym = f"{asset}{STABLE}"
+                    px = tickers.get(sym)
+                    if px:
+                        total_value_stable += amount * px
 
             print(f"Estimated total portfolio value: {total_value_stable:.2f} {STABLE}")
 
@@ -184,18 +204,18 @@ def main():
                 lower = pair["lower_ratio"]
                 alloc_pct = pair["allocation_pct"]
 
-                sym_a = f"{coin_a}/{STABLE}"
-                sym_b = f"{coin_b}/{STABLE}"
+                sym_a = to_symbol(coin_a)
+                sym_b = to_symbol(coin_b)
 
-                if sym_a not in tickers or sym_b not in tickers:
+                price_a = tickers.get(sym_a)
+                price_b = tickers.get(sym_b)
+
+                if price_a is None or price_b is None:
                     print(f"[{name}] Missing ticker for {sym_a} or {sym_b}, skipping.")
                     continue
 
-                price_a = tickers[sym_a]["last"]
-                price_b = tickers[sym_b]["last"]
-
-                if not price_b:
-                    print(f"[{name}] price_b is zero/None, skipping.")
+                if price_b == 0:
+                    print(f"[{name}] price_b is zero, skipping.")
                     continue
 
                 ratio = price_a / price_b
@@ -236,6 +256,7 @@ def main():
 
                 # ===== EXECUTION =====
 
+                # From coin_a -> coin_b
                 if current_asset == coin_a and ratio > upper:
                     if value_pair <= 0:
                         print(f"[{name}] No {coin_a} value to trade, skipping.")
@@ -258,18 +279,32 @@ def main():
                         print(f"[{name}] [DRY RUN] SELL {sym_a} {amount_a_to_sell:.6f}")
                         print(f"[{name}] [DRY RUN] Then BUY {sym_b} with available {STABLE}")
                     else:
-                        sell_order = exchange.create_market_sell_order(sym_a, amount_a_to_sell)
-                        print(f"[{name}] Sell order: {sell_order}")
+                        # Market sell coin_a for STABLE
+                        try:
+                            sell_order = client.order_market_sell(
+                                symbol=sym_a,
+                                quantity=amount_a_to_sell,
+                            )
+                            print(f"[{name}] Sell order: {sell_order}")
+                        except BinanceAPIException as e:
+                            print(f"[{name}] Sell order error: {e}")
+                            continue
 
-                        balances = exchange.fetch_balance()
-                        free_bal = balances["free"]
+                        # Refresh balances after sell
+                        free_bal = load_balances(client)
                         bal_stable = free_bal.get(STABLE, 0.0)
 
                         stable_for_pair = min(bal_stable, max_capital)
                         if stable_for_pair > 0:
                             amount_b_to_buy = stable_for_pair / price_b
-                            buy_order = exchange.create_market_buy_order(sym_b, amount_b_to_buy)
-                            print(f"[{name}] Buy order: {buy_order}")
+                            try:
+                                buy_order = client.order_market_buy(
+                                    symbol=sym_b,
+                                    quantity=amount_b_to_buy,
+                                )
+                                print(f"[{name}] Buy order: {buy_order}")
+                            except BinanceAPIException as e:
+                                print(f"[{name}] Buy order error: {e}")
                         else:
                             print(f"[{name}] No {STABLE} after sell, skipping buy.")
 
@@ -277,6 +312,7 @@ def main():
                         state[name] = pair_state
                         save_state(state)
 
+                # From coin_b -> coin_a
                 elif current_asset == coin_b and ratio < lower:
                     if value_pair <= 0:
                         print(f"[{name}] No {coin_b} value to trade, skipping.")
@@ -299,24 +335,38 @@ def main():
                         print(f"[{name}] [DRY RUN] SELL {sym_b} {amount_b_to_sell:.6f}")
                         print(f"[{name}] [DRY RUN] Then BUY {sym_a} with available {STABLE}")
                     else:
-                        sell_order = exchange.create_market_sell_order(sym_b, amount_b_to_sell)
-                        print(f"[{name}] Sell order: {sell_order}")
+                        # Market sell coin_b for STABLE
+                        try:
+                            sell_order = client.order_market_sell(
+                                symbol=sym_b,
+                                quantity=amount_b_to_sell,
+                            )
+                            print(f"[{name}] Sell order: {sell_order}")
+                        except BinanceAPIException as e:
+                            print(f"[{name}] Sell order error: {e}")
+                            continue
 
-                        balances = exchange.fetch_balance()
-                        free_bal = balances["free"]
+                        free_bal = load_balances(client)
                         bal_stable = free_bal.get(STABLE, 0.0)
 
                         stable_for_pair = min(bal_stable, max_capital)
                         if stable_for_pair > 0:
                             amount_a_to_buy = stable_for_pair / price_a
-                            buy_order = exchange.create_market_buy_order(sym_a, amount_a_to_buy)
-                            print(f"[{name}] Buy order: {buy_order}")
+                            try:
+                                buy_order = client.order_market_buy(
+                                    symbol=sym_a,
+                                    quantity=amount_a_to_buy,
+                                )
+                                print(f"[{name}] Buy order: {buy_order}")
+                            except BinanceAPIException as e:
+                                print(f"[{name}] Buy order error: {e}")
                         else:
                             print(f"[{name}] No {STABLE} after sell, skipping buy.")
 
                         pair_state["current_asset"] = coin_a
                         state[name] = pair_state
                         save_state(state)
+
                 else:
                     print(f"[{name}] No trade condition met, holding.")
 
