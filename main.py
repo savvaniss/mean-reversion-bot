@@ -111,9 +111,15 @@ def main():
         },
     })
 
-    # Testnet / mainnet switch
     if USE_TESTNET:
         exchange.set_sandbox_mode(True)
+
+        # 🔥 Required for Binance Spot Testnet to avoid signature errors
+        exchange.urls["api"] = {
+            "public": "https://testnet.binance.vision/api",
+            "private": "https://testnet.binance.vision/api",
+        }
+
 
     # Collect all tickers we’ll need (for efficiency)
     needed_symbols = set()
